@@ -825,6 +825,7 @@ resource "aws_route_table_association" "public" {
 }
 ```
 
+---
 ## ☸️ Section 7: Provisioning AWS EKS with Terraform
 
 The EKS cluster is provisioned using **raw AWS resources** — no pre-built modules. Every IAM role, policy attachment, cluster resource, and node group is explicitly defined in `eks-install/`. This section walks through each resource block exactly as it exists in the code.
