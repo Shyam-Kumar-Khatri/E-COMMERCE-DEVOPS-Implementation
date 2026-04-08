@@ -32,10 +32,21 @@
 - [Section 5: Containerizing & Pushing Images](#-section-5-containerizing--pushing-images)
 - [Section 6: Infrastructure as Code with Terraform](#-section-6-infrastructure-as-code-with-terraform)
   - [Terraform Core Concepts](#61-terraform-core-concepts)
+  - [Terraform Lifecycle](#62-terraform-lifecycle)
   - [Remote State with S3 & DynamoDB](#63-remote-state-with-s3--dynamodb-locking)
   - [Provisioning VPC with Terraform](#64-provisioning-vpc-with-terraform)
+    - [VPC](#1-creating-a-vpc)
+    - [Private Subnets](#2-creating-private-subnets)
+    - [Public Subnets](#3-creating-public-subnets)
+    - [Internet Gateway](#4-creating-an-internet-gateway)
+    - [NAT Gateway & Elastic IPs](#5-creating-nat-gateway-and-elastic-ips)
+    - [Route Tables](#6-creating-route-tables)
 - [Section 7: Provisioning AWS EKS with Terraform](#-section-7-provisioning-aws-eks-with-terraform)
-  - [EKS Cluster Configuration](#71-eks-cluster-configuration)
+  - [IAM Role for EKS Cluster](#1-creating-iam-role-for-eks-cluster)
+  - [Creating the EKS Cluster](#3-creating-the-eks-cluster)
+  - [IAM Role for Node Group](#4-creating-iam-role-for-node-group)
+  - [Node Group Policies](#5-attaching-iam-policies-to-node-role)
+  - [Creating EKS Node Group](#6-creating-eks-node-group)
   - [Connect kubectl to EKS](#72-configure-kubectl-to-connect-to-eks)
 - [Section 8: Kubernetes on EKS](#-section-8-kubernetes-on-eks)
   - [Core Kubernetes Concepts Used](#core-kubernetes-concepts-used)
@@ -569,17 +580,17 @@ make push          # Push all images to ECR
 
 ## 🏗 Section 6: Infrastructure as Code with Terraform
 
-All AWS infrastructure is provisioned using Terraform, stored in the `eks-install/` directory.
+All AWS infrastructure is provisioned using Terraform. The code lives in the `eks-install/` directory and uses **raw AWS resources** — no third-party modules — giving full visibility into exactly what gets created.
 
 ### 6.1 Terraform Core Concepts
 
 | Concept | Description |
 |---|---|
 | `provider` | Plugin to interact with the AWS API |
-| `resource` | A cloud object to create (e.g., `aws_eks_cluster`) |
+| `resource` | A cloud object to create (e.g., `aws_vpc`, `aws_eks_cluster`) |
 | `variable` | Parameterize configs for reuse across environments |
-| `output` | Export values after apply (e.g., cluster endpoint) |
-| `module` | Reusable group of resources |
+| `output` | Export values after apply (e.g., cluster endpoint, subnet IDs) |
+| `count` | Create multiple instances of a resource dynamically |
 | `state` | Terraform's record of real-world infrastructure |
 
 ### 6.2 Terraform Lifecycle
@@ -595,7 +606,7 @@ terraform destroy   # Tear everything down
 
 ### 6.3 Remote State with S3 & DynamoDB Locking
 
-Storing state locally works for a single developer, but in any team environment remote state is required to prevent corruption.
+Storing state locally works for a single developer, but in any team environment remote state is required to prevent corruption when multiple people run `terraform apply` simultaneously.
 
 **Step 1 — Create the S3 bucket:**
 ```bash
@@ -617,7 +628,7 @@ aws dynamodb create-table \
   --billing-mode PAY_PER_REQUEST
 ```
 
-**Step 3 — Configure backend in `eks-install/main.tf`:**
+**Step 3 — Configure the backend:**
 ```hcl
 terraform {
   backend "s3" {
@@ -632,87 +643,337 @@ terraform {
 
 ### 6.4 Provisioning VPC with Terraform
 
-The VPC separates public-facing resources (load balancers) from internal workloads (EKS nodes).
+The VPC is built using **raw AWS resources** (not a pre-built module), so every piece of the network is explicitly defined. This gives complete control and makes it easy to understand exactly what gets provisioned.
+
+The VPC network layout looks like this:
+
+```
+
+                    ┌──────────────────────────────────────┐
+                    │              AWS VPC                 │
+                    │         (var.vpc_cidr)               │
+                    │                                      │
+      ┌─────────────┴──────────────┐  ┌────────────────────┴───────────┐
+      │       Public Subnets       │  │      Private Subnets           │
+      │  (map_public_ip_on_launch) │  │   (EKS worker nodes live here) │
+      │                            │  │                                │
+      │  ┌──────────────────────┐  │  │  ┌──────────────────────────┐  │
+      │  │   NAT Gateway + EIP  │  │  │  │   EKS Worker Nodes       │  │
+      │  └──────────┬───────────┘  │  │  └────────────┬─────────────┘  │
+      └─────────────┼──────────────┘  └───────────────┼────────────────┘
+                    │   outbound                      │ outbound via NAT
+                    ▼                                 ▼
+          ┌─────────────────┐                ┌─────────────────┐
+          │ Internet Gateway│◄───────────────│   NAT Gateway   │
+          └─────────────────┘                └─────────────────┘
+                    │
+                    ▼
+                Internet
+
+```
+
+#### 1. Creating a VPC
 
 ```hcl
-module "vpc" {
-  source  = "terraform-aws-modules/vpc/aws"
-  version = "5.0.0"
-
-  name = "eks-vpc"
-  cidr = "10.0.0.0/16"
-
-  azs             = ["us-east-1a", "us-east-1b"]
-  private_subnets = ["10.0.1.0/24", "10.0.2.0/24"]
-  public_subnets  = ["10.0.101.0/24", "10.0.102.0/24"]
-
-  enable_nat_gateway   = true
-  single_nat_gateway   = true   # one NAT GW saves cost (use multiple for HA)
+resource "aws_vpc" "main" {
+  cidr_block           = var.vpc_cidr
   enable_dns_hostnames = true
+  enable_dns_support   = true
 
-  # Required tags for EKS to discover subnets
-  private_subnet_tags = {
-    "kubernetes.io/role/internal-elb" = "1"
-  }
-  public_subnet_tags = {
-    "kubernetes.io/role/elb" = "1"
+  tags = {
+    Name                                        = "${var.cluster_name}-vpc"
+    "kubernetes.io/cluster/${var.cluster_name}" = "shared"
   }
 }
 ```
 
----
+- Creates the VPC with the CIDR block defined in `var.vpc_cidr`
+- Enables DNS support and DNS hostnames — required for EKS nodes to resolve service names
+- Tags the VPC with the cluster name so Kubernetes can discover it
+
+#### 2. Creating Private Subnets
+
+```hcl
+resource "aws_subnet" "private" {
+  count             = length(var.private_subnet_cidrs)
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = var.private_subnet_cidrs[count.index]
+  availability_zone = var.availability_zones[count.index]
+
+  tags = {
+    Name                                        = "${var.cluster_name}-private-${count.index + 1}"
+    "kubernetes.io/cluster/${var.cluster_name}" = "shared"
+    "kubernetes.io/role/internal-elb"           = "1"
+  }
+}
+```
+
+- Creates one private subnet per entry in `var.private_subnet_cidrs`, spread across availability zones
+- EKS worker nodes are placed in these private subnets — they are **not directly reachable from the internet**
+- The `internal-elb` tag tells Kubernetes to provision internal load balancers in these subnets
+
+#### 3. Creating Public Subnets
+
+```hcl
+resource "aws_subnet" "public" {
+  count             = length(var.public_subnet_cidrs)
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = var.public_subnet_cidrs[count.index]
+  availability_zone = var.availability_zones[count.index]
+
+  map_public_ip_on_launch = true
+
+  tags = {
+    Name                                        = "${var.cluster_name}-public-${count.index + 1}"
+    "kubernetes.io/cluster/${var.cluster_name}" = "shared"
+    "kubernetes.io/role/elb"                    = "1"
+  }
+}
+```
+
+- Creates public subnets where instances automatically receive a public IP on launch
+- The `elb` tag tells Kubernetes to provision internet-facing load balancers (ALBs) here
+- NAT gateways are also placed in these public subnets
+
+#### 4. Creating an Internet Gateway
+
+```hcl
+resource "aws_internet_gateway" "main" {
+  vpc_id = aws_vpc.main.id
+
+  tags = {
+    Name = "${var.cluster_name}-igw"
+  }
+}
+```
+
+- Attaches an Internet Gateway to the VPC, enabling traffic from public subnets to reach the internet
+
+#### 5. Creating NAT Gateway and Elastic IPs
+
+```hcl
+resource "aws_eip" "nat" {
+  count  = length(var.public_subnet_cidrs)
+  domain = "vpc"
+
+  tags = {
+    Name = "${var.cluster_name}-nat-${count.index + 1}"
+  }
+}
+
+resource "aws_nat_gateway" "main" {
+  count         = length(var.public_subnet_cidrs)
+  allocation_id = aws_eip.nat[count.index].id
+  subnet_id     = aws_subnet.public[count.index].id
+
+  tags = {
+    Name = "${var.cluster_name}-nat-${count.index + 1}"
+  }
+}
+```
+
+- One Elastic IP and one NAT Gateway are created per public subnet
+- EKS worker nodes in private subnets use the NAT Gateway to make outbound calls (e.g., pulling Docker images from ECR) **without being directly exposed to the internet**
+
+#### 6. Creating Route Tables
+
+**Public route table** — routes all internet traffic through the Internet Gateway:
+```hcl
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.main.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.main.id
+  }
+
+  tags = {
+    Name = "${var.cluster_name}-public"
+  }
+}
+```
+
+**Private route tables** — routes outbound traffic from private subnets through the NAT Gateway:
+```hcl
+resource "aws_route_table" "private" {
+  count  = length(var.private_subnet_cidrs)
+  vpc_id = aws_vpc.main.id
+
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.main[count.index].id
+  }
+
+  tags = {
+    Name = "${var.cluster_name}-private-${count.index + 1}"
+  }
+}
+```
+
+**Route table associations** — link each subnet to its route table:
+```hcl
+resource "aws_route_table_association" "private" {
+  count          = length(var.private_subnet_cidrs)
+  subnet_id      = aws_subnet.private[count.index].id
+  route_table_id = aws_route_table.private[count.index].id
+}
+
+resource "aws_route_table_association" "public" {
+  count          = length(var.public_subnet_cidrs)
+  subnet_id      = aws_subnet.public[count.index].id
+  route_table_id = aws_route_table.public.id
+}
+```
 
 ## ☸️ Section 7: Provisioning AWS EKS with Terraform
 
-The `eks-install/` directory provisions the full EKS cluster with all required IAM roles and node groups.
+The EKS cluster is provisioned using **raw AWS resources** — no pre-built modules. Every IAM role, policy attachment, cluster resource, and node group is explicitly defined in `eks-install/`. This section walks through each resource block exactly as it exists in the code.
 
-### 7.1 EKS Cluster Configuration
+#### 1. Creating IAM Role for EKS Cluster
 
 ```hcl
-module "eks" {
-  source  = "terraform-aws-modules/eks/aws"
-  version = "19.0.0"
+resource "aws_iam_role" "cluster" {
+  name = "${var.cluster_name}-cluster-role"
 
-  cluster_name    = "ecommerce-devops-cluster"
-  cluster_version = "1.29"
-
-  vpc_id     = module.vpc.vpc_id
-  subnet_ids = module.vpc.private_subnets
-
-  cluster_endpoint_public_access = true
-
-  eks_managed_node_groups = {
-    general = {
-      desired_size   = 2
-      min_size       = 2
-      max_size       = 5
-      instance_types = ["t3.medium"]
-      capacity_type  = "ON_DEMAND"
-    }
-  }
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
+      Principal = {
+        Service = "eks.amazonaws.com"
+      }
+    }]
+  })
 }
 ```
 
+- Creates an IAM role that the **EKS control plane** can assume
+- The trust policy allows `eks.amazonaws.com` to call `sts:AssumeRole` — this is what authorizes the EKS service to act on your behalf
+
+#### 2. Attaching IAM Policy to Cluster Role
+
+```hcl
+resource "aws_iam_role_policy_attachment" "cluster_policy" {
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy"
+  role       = aws_iam_role.cluster.name
+}
+```
+
+- Attaches `AmazonEKSClusterPolicy` to the cluster role
+- This policy grants EKS the permissions it needs to manage networking, logging, and node communication on your behalf
+
+#### 3. Creating the EKS Cluster
+
+```hcl
+resource "aws_eks_cluster" "main" {
+  name     = var.cluster_name
+  version  = var.cluster_version
+  role_arn = aws_iam_role.cluster.arn
+
+  vpc_config {
+    subnet_ids = var.subnet_ids
+  }
+
+  depends_on = [
+    aws_iam_role_policy_attachment.cluster_policy
+  ]
+}
+```
+
+- Creates the EKS cluster with the name and Kubernetes version from variables
+- The `vpc_config` block places the cluster inside the VPC subnets provisioned in Section 6
+- `depends_on` ensures the IAM policy is fully attached **before** the cluster is created — without this, the cluster creation would fail
+
+#### 4. Creating IAM Role for Node Group
+
+```hcl
+resource "aws_iam_role" "node" {
+  name = "${var.cluster_name}-node-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
+      Principal = {
+        Service = "ec2.amazonaws.com"
+      }
+    }]
+  })
+}
+```
+
+- Creates a separate IAM role for the **EC2 worker nodes**
+- The trust policy allows `ec2.amazonaws.com` to assume this role — every node in the group runs as an EC2 instance and needs this role to interact with the cluster and AWS services
+
+#### 5. Attaching IAM Policies to Node Role
+
+```hcl
+resource "aws_iam_role_policy_attachment" "node_policy" {
+  for_each = toset([
+    "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy",
+    "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy",
+    "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+  ])
+
+  policy_arn = each.value
+  role       = aws_iam_role.node.name
+}
+```
+
+Three AWS managed policies are attached to every worker node using `for_each`:
+
+| Policy | Purpose |
+|---|---|
+| `AmazonEKSWorkerNodePolicy` | Allows nodes to join the cluster and communicate with the control plane |
+| `AmazonEKS_CNI_Policy` | Allows the VPC CNI plugin to assign and manage pod IP addresses |
+| `AmazonEC2ContainerRegistryReadOnly` | Allows nodes to pull container images from ECR |
+
+#### 6. Creating EKS Node Group
+
+```hcl
+resource "aws_eks_node_group" "main" {
+  for_each = var.node_groups
+
+  cluster_name    = aws_eks_cluster.main.name
+  node_group_name = each.key
+  node_role_arn   = aws_iam_role.node.arn
+  subnet_ids      = var.subnet_ids
+
+  instance_types = each.value.instance_types
+  capacity_type  = each.value.capacity_type
+
+  scaling_config {
+    desired_size = each.value.scaling_config.desired_size
+    max_size     = each.value.scaling_config.max_size
+    min_size     = each.value.scaling_config.min_size
+  }
+
+  depends_on = [
+    aws_iam_role_policy_attachment.node_policy
+  ]
+}
+```
+
+- Uses `for_each` over `var.node_groups` — meaning **multiple node groups** can be defined as variables, and each one gets its own `aws_eks_node_group` resource automatically
+- `capacity_type` can be set to `ON_DEMAND` or `SPOT` per node group
+- `scaling_config` configures auto-scaling with `desired_size`, `min_size`, and `max_size`
+- `depends_on` ensures all three IAM policies are attached before the node group is created, so nodes can successfully join and pull images on first boot
+
 ### 7.2 Configure kubectl to Connect to EKS
 
-After `terraform apply` completes:
+After `terraform apply` completes, connect your local `kubectl` to the new cluster:
 
 ```bash
 aws eks update-kubeconfig \
   --region us-east-1 \
-  --name ecommerce-devops-cluster
+  --name <var.cluster_name>
 
 # Verify nodes are ready
 kubectl get nodes
 kubectl get nodes -o wide
 ```
-
-### 7.3 IAM Roles Created by Terraform
-
-Terraform automatically creates and attaches the required IAM roles:
-
-- **EKS Cluster Role** — allows the control plane to manage AWS resources
-- **EKS Node Group Role** — allows worker nodes to pull ECR images, join the cluster, and use the VPC CNI plugin
 
 ---
 
